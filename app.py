@@ -8,11 +8,13 @@ from datetime import datetime, timedelta
 from typing import List, Dict, Any, Optional, Set
 from dataclasses import dataclass
 import logging
+from concurrent.futures import ThreadPoolExecutor
 
 from flask import Flask, render_template, request, jsonify, session
 from flask_cors import CORS
 import requests
 from requests.auth import HTTPBasicAuth
+from requests.adapters import HTTPAdapter, Retry
 import numpy as np
 from sentence_transformers import SentenceTransformer
 from sklearn.feature_extraction.text import TfidfVectorizer
@@ -60,12 +62,15 @@ class Document:
 class DatabaseManager:
     def __init__(self, db_path='confluence_rag.db'):
         self.db_path = db_path
+        # Persistent connection with thread safety
+        self.conn = sqlite3.connect(self.db_path, check_same_thread=False)
+        self.lock = threading.Lock()
         self.init_database()
     
     def init_database(self):
         """Initialize the SQLite database with required tables."""
-        with sqlite3.connect(self.db_path) as conn:
-            cursor = conn.cursor()
+        with self.lock:
+            cursor = self.conn.cursor()
             
             # Documents table
             cursor.execute('''
@@ -112,8 +117,15 @@ class DatabaseManager:
                     updated_at TEXT NOT NULL
                 )
             ''')
+
+            # Full-text search virtual table for titles
+            cursor.execute('''
+                CREATE VIRTUAL TABLE IF NOT EXISTS fts_documents USING fts5(
+                    id, title, content, excerpt
+                )
+            ''')
             
-            conn.commit()
+            self.conn.commit()
             
     def get_page_by_title(self, title: str, space_name: str = None) -> dict:
         """
@@ -127,8 +139,8 @@ class DatabaseManager:
             dict: Page information including ID, or None if not found
         """
         try:
-            with sqlite3.connect(self.db_path) as conn:
-                cursor = conn.cursor()
+            with self.lock:
+                cursor = self.conn.cursor()
                 
                 if space_name:
                     # Search within specific space
@@ -185,40 +197,29 @@ class DatabaseManager:
             list: List of matching pages with similarity scores
         """
         try:
-            with sqlite3.connect(self.db_path) as conn:
-                cursor = conn.cursor()
-                
-                # Use LIKE for partial matching
-                search_title = f"%{title}%"
-                
+            with self.lock:
+                cursor = self.conn.cursor()
+
+                query = f"title:{title}*"
+
                 if space_name:
                     cursor.execute('''
-                        SELECT id, title, content, space_key, space_name, type, url, last_modified, excerpt
-                        FROM documents 
-                        WHERE title LIKE ? AND space_name = ?
-                        ORDER BY 
-                            CASE 
-                                WHEN title = ? THEN 1
-                                WHEN title LIKE ? THEN 2
-                                ELSE 3
-                            END,
-                            title
+                        SELECT d.id, d.title, d.content, d.space_key, d.space_name, d.type,
+                               d.url, d.last_modified, d.excerpt
+                        FROM documents d
+                        JOIN fts_documents f ON d.id = f.id
+                        WHERE f MATCH ? AND d.space_name = ?
                         LIMIT ?
-                    ''', (search_title, space_name, title, f"{title}%", limit))
+                    ''', (query, space_name, limit))
                 else:
                     cursor.execute('''
-                        SELECT id, title, content, space_key, space_name, type, url, last_modified, excerpt
-                        FROM documents 
-                        WHERE title LIKE ?
-                        ORDER BY 
-                            CASE 
-                                WHEN title = ? THEN 1
-                                WHEN title LIKE ? THEN 2
-                                ELSE 3
-                            END,
-                            title
+                        SELECT d.id, d.title, d.content, d.space_key, d.space_name, d.type,
+                               d.url, d.last_modified, d.excerpt
+                        FROM documents d
+                        JOIN fts_documents f ON d.id = f.id
+                        WHERE f MATCH ?
                         LIMIT ?
-                    ''', (search_title, title, f"{title}%", limit))
+                    ''', (query, limit))
                 
                 results = cursor.fetchall()
                 
@@ -284,10 +285,10 @@ class DatabaseManager:
     
     def save_document(self, doc: Document, embedding: np.ndarray):
         """Save document with its embedding to the database."""
-        with sqlite3.connect(self.db_path) as conn:
-            cursor = conn.cursor()
+        with self.lock:
+            cursor = self.conn.cursor()
             cursor.execute('''
-                INSERT OR REPLACE INTO documents 
+                INSERT OR REPLACE INTO documents
                 (id, title, content, space_key, space_name, type, url, last_modified, excerpt, embedding)
                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ''', (
@@ -295,12 +296,19 @@ class DatabaseManager:
                 doc.type, doc.url, doc.last_modified, doc.excerpt,
                 embedding.tobytes()
             ))
-            conn.commit()
+            # Update FTS table
+            cursor.execute('''
+                INSERT OR REPLACE INTO fts_documents (id, title, content, excerpt)
+                VALUES (?, ?, ?, ?)
+            ''', (
+                doc.id, doc.title, doc.content, doc.excerpt
+            ))
+            self.conn.commit()
     
     def get_document(self, doc_id: str) -> Optional[Document]:
         """Get document by ID."""
-        with sqlite3.connect(self.db_path) as conn:
-            cursor = conn.cursor()
+        with self.lock:
+            cursor = self.conn.cursor()
             cursor.execute('SELECT * FROM documents WHERE id = ?', (doc_id,))
             row = cursor.fetchone()
             if row:
@@ -313,23 +321,23 @@ class DatabaseManager:
     
     def get_document_last_modified(self, doc_id: str) -> Optional[str]:
         """Get document's last modified timestamp."""
-        with sqlite3.connect(self.db_path) as conn:
-            cursor = conn.cursor()
+        with self.lock:
+            cursor = self.conn.cursor()
             cursor.execute('SELECT last_modified FROM documents WHERE id = ?', (doc_id,))
             row = cursor.fetchone()
             return row[0] if row else None
     
     def get_all_document_ids(self) -> Set[str]:
         """Get all document IDs in the database."""
-        with sqlite3.connect(self.db_path) as conn:
-            cursor = conn.cursor()
+        with self.lock:
+            cursor = self.conn.cursor()
             cursor.execute('SELECT id FROM documents')
             return {row[0] for row in cursor.fetchall()}
     
     def get_all_documents(self, space_key: str = None) -> List[Document]:
         """Get all documents, optionally filtered by space."""
-        with sqlite3.connect(self.db_path) as conn:
-            cursor = conn.cursor()
+        with self.lock:
+            cursor = self.conn.cursor()
             if space_key:
                 cursor.execute('SELECT * FROM documents WHERE space_key = ?', (space_key,))
             else:
@@ -344,50 +352,51 @@ class DatabaseManager:
     
     def delete_document(self, doc_id: str):
         """Delete document from database."""
-        with sqlite3.connect(self.db_path) as conn:
-            cursor = conn.cursor()
+        with self.lock:
+            cursor = self.conn.cursor()
             cursor.execute('DELETE FROM documents WHERE id = ?', (doc_id,))
-            conn.commit()
+            cursor.execute('DELETE FROM fts_documents WHERE id = ?', (doc_id,))
+            self.conn.commit()
     
     def save_space(self, space_key: str, space_name: str, description: str = ""):
         """Save space information."""
-        with sqlite3.connect(self.db_path) as conn:
-            cursor = conn.cursor()
+        with self.lock:
+            cursor = self.conn.cursor()
             cursor.execute('''
                 INSERT OR REPLACE INTO spaces (key, name, description, last_synced)
                 VALUES (?, ?, ?, ?)
             ''', (space_key, space_name, description, datetime.now().isoformat()))
-            conn.commit()
+            self.conn.commit()
     
     def get_spaces(self) -> List[Dict]:
         """Get all spaces."""
-        with sqlite3.connect(self.db_path) as conn:
-            cursor = conn.cursor()
+        with self.lock:
+            cursor = self.conn.cursor()
             cursor.execute('SELECT key, name, description FROM spaces')
             return [{'key': row[0], 'name': row[1], 'description': row[2]} for row in cursor.fetchall()]
     
     def get_space_key_by_name(self, space_name: str) -> Optional[str]:
         """Get space key by space name."""
-        with sqlite3.connect(self.db_path) as conn:
-            cursor = conn.cursor()
+        with self.lock:
+            cursor = self.conn.cursor()
             cursor.execute('SELECT key FROM spaces WHERE LOWER(name) = LOWER(?)', (space_name,))
             row = cursor.fetchone()
             return row[0] if row else None
     
     def set_sync_metadata(self, key: str, value: str):
         """Set sync metadata."""
-        with sqlite3.connect(self.db_path) as conn:
-            cursor = conn.cursor()
+        with self.lock:
+            cursor = self.conn.cursor()
             cursor.execute('''
                 INSERT OR REPLACE INTO sync_metadata (key, value, updated_at)
                 VALUES (?, ?, ?)
             ''', (key, value, datetime.now().isoformat()))
-            conn.commit()
+            self.conn.commit()
     
     def get_sync_metadata(self, key: str) -> Optional[str]:
         """Get sync metadata."""
-        with sqlite3.connect(self.db_path) as conn:
-            cursor = conn.cursor()
+        with self.lock:
+            cursor = self.conn.cursor()
             cursor.execute('SELECT value FROM sync_metadata WHERE key = ?', (key,))
             row = cursor.fetchone()
             return row[0] if row else None
@@ -395,25 +404,24 @@ class DatabaseManager:
     def semantic_search(self, query: str, space_key: str = None, limit: int = 5) -> List[Dict]:
         """Perform semantic search on documents."""
         query_embedding = embedding_model.encode([query])
-        
-        with sqlite3.connect(self.db_path) as conn:
-            cursor = conn.cursor()
+
+        with self.lock:
+            cursor = self.conn.cursor()
             if space_key:
                 cursor.execute('SELECT * FROM documents WHERE space_key = ?', (space_key,))
             else:
                 cursor.execute('SELECT * FROM documents')
-            
+
             rows = cursor.fetchall()
-            
+
             if not rows:
                 return []
-            
-            # Calculate similarities
+
+            embeddings = np.vstack([np.frombuffer(row[9], dtype=np.float32) for row in rows])
+            similarities = cosine_similarity(query_embedding, embeddings)[0]
+
             results = []
-            for row in rows:
-                doc_embedding = np.frombuffer(row[9], dtype=np.float32).reshape(1, -1)
-                similarity = cosine_similarity(query_embedding, doc_embedding)[0][0]
-                
+            for row, sim in zip(rows, similarities):
                 results.append({
                     'id': row[0],
                     'title': row[1],
@@ -424,7 +432,7 @@ class DatabaseManager:
                     'url': row[6],
                     'last_modified': row[7],
                     'excerpt': row[8],
-                    'similarity': float(similarity)
+                    'similarity': float(sim)
                 })
             
             # Sort by similarity and return top results
@@ -433,27 +441,41 @@ class DatabaseManager:
     
     def add_chat_message(self, session_id: str, role: str, content: str):
         """Add message to chat history."""
-        with sqlite3.connect(self.db_path) as conn:
-            cursor = conn.cursor()
+        with self.lock:
+            cursor = self.conn.cursor()
             cursor.execute('''
                 INSERT INTO chat_history (session_id, role, content, timestamp)
                 VALUES (?, ?, ?, ?)
             ''', (session_id, role, content, datetime.now().isoformat()))
-            conn.commit()
+            self.conn.commit()
+            self.prune_chat_history(session_id)
     
     def get_chat_history(self, session_id: str, limit: int = 10) -> List[Dict]:
         """Get chat history for a session."""
-        with sqlite3.connect(self.db_path) as conn:
-            cursor = conn.cursor()
+        with self.lock:
+            cursor = self.conn.cursor()
             cursor.execute('''
-                SELECT role, content, timestamp FROM chat_history 
-                WHERE session_id = ? 
-                ORDER BY timestamp DESC 
+                SELECT role, content, timestamp FROM chat_history
+                WHERE session_id = ?
+                ORDER BY timestamp DESC
                 LIMIT ?
             ''', (session_id, limit))
-            
+
             rows = cursor.fetchall()
             return [{'role': row[0], 'content': row[1], 'timestamp': row[2]} for row in reversed(rows)]
+
+    def prune_chat_history(self, session_id: str, max_length: int = 50):
+        """Keep chat history per session under a maximum length."""
+        cursor = self.conn.cursor()
+        cursor.execute('''
+            DELETE FROM chat_history
+            WHERE id IN (
+                SELECT id FROM chat_history WHERE session_id = ?
+                ORDER BY timestamp DESC
+                LIMIT -1 OFFSET ?
+            )
+        ''', (session_id, max_length))
+        self.conn.commit()
 
 
 def sync_confluence_data():
@@ -477,6 +499,9 @@ def sync_confluence_data():
         updated_count = 0
         skipped_count = 0
         
+        docs_to_embed = []
+        embed_flags = []
+
         for item in content_items:
             try:
                 doc_id = item['id']
@@ -511,24 +536,27 @@ def sync_confluence_data():
                     excerpt=content[:300] if content else item['title']
                 )
                 
-                # Generate embedding only for new/modified documents
-                logger.info(f"Processing document: {doc.title} ({doc_id})")
-                embedding = embedding_model.encode([f"{doc.title} {doc.content}"])[0]
-                
-                # Save to database
-                db_manager.save_document(doc, embedding)
-                
-                if existing_last_modified:
-                    updated_count += 1
-                    logger.info(f"Updated document: {doc.title}")
-                else:
-                    added_count += 1
-                    logger.info(f"Added new document: {doc.title}")
+                logger.info(f"Queueing document for embedding: {doc.title} ({doc_id})")
+                docs_to_embed.append(doc)
+                embed_flags.append(bool(existing_last_modified))
                 
             except Exception as e:
                 logger.error(f"Error syncing document {item['id']}: {e}")
                 continue
         
+        # Batch embedding computation
+        if docs_to_embed:
+            texts = [f"{d.title} {d.content}" for d in docs_to_embed]
+            embeddings = embedding_model.encode(texts, batch_size=32)
+            for doc, emb, existed in zip(docs_to_embed, embeddings, embed_flags):
+                db_manager.save_document(doc, emb)
+                if existed:
+                    updated_count += 1
+                    logger.info(f"Updated document: {doc.title}")
+                else:
+                    added_count += 1
+                    logger.info(f"Added new document: {doc.title}")
+
         # Handle deleted documents (exist in DB but not in Confluence)
         deleted_doc_ids = existing_doc_ids - current_doc_ids
         deleted_count = 0
@@ -631,58 +659,74 @@ class ConfluenceAPI:
             'Accept': 'application/json',
             'Content-Type': 'application/json'
         }
+        self.session = requests.Session()
+        retries = Retry(total=3, backoff_factor=0.5, status_forcelist=[500,502,503,504])
+        adapter = HTTPAdapter(max_retries=retries)
+        self.session.mount('http://', adapter)
+        self.session.mount('https://', adapter)
     
     def get_spaces(self) -> List[Dict]:
         """Get all spaces from Confluence."""
         try:
-            response = requests.get(
+            response = self.session.get(
                 f"{self.base_url}/rest/api/space",
                 auth=self.auth,
                 headers=self.headers,
-                params={'limit': 100}
+                params={'limit': 100},
+                timeout=10
             )
             response.raise_for_status()
             return response.json().get('results', [])
-        except Exception as e:
-            logger.error(f"Error getting spaces: {e}")
+        except requests.RequestException as e:
+            status = e.response.status_code if e.response else 'N/A'
+            logger.error(f"Error getting spaces ({status}): {e}")
             return []
     
     def get_content_by_space(self, space_key: str = None) -> List[Dict]:
         """Get content from Confluence, optionally filtered by space."""
         try:
-            params = {
-                'expand': 'body.storage,space,version,history.lastUpdated',
-                'limit': 100
-            }
-            
+            params = {'limit': 100}
             if space_key:
                 params['spaceKey'] = space_key
-            
-            response = requests.get(
+
+            response = self.session.get(
                 f"{self.base_url}/rest/api/content",
                 auth=self.auth,
                 headers=self.headers,
-                params=params
+                params=params,
+                timeout=10
             )
             response.raise_for_status()
-            return response.json().get('results', [])
-        except Exception as e:
-            logger.error(f"Error getting content: {e}")
+            items = response.json().get('results', [])
+            page_ids = [item['id'] for item in items]
+
+            pages = []
+            with ThreadPoolExecutor(max_workers=5) as executor:
+                for page in executor.map(self.get_page_by_id, page_ids):
+                    if page:
+                        pages.append(page)
+
+            return pages
+        except requests.RequestException as e:
+            status = e.response.status_code if e.response else 'N/A'
+            logger.error(f"Error getting content ({status}): {e}")
             return []
     
     def get_page_by_id(self, page_id: str) -> Optional[Dict]:
         """Get page details by ID."""
         try:
-            response = requests.get(
+            response = self.session.get(
                 f"{self.base_url}/rest/api/content/{page_id}",
                 auth=self.auth,
                 headers=self.headers,
-                params={'expand': 'version,space'}
+                params={'expand': 'body.storage,version,space,history.lastUpdated'},
+                timeout=10
             )
             response.raise_for_status()
             return response.json()
-        except Exception as e:
-            logger.error(f"Error getting page {page_id}: {e}")
+        except requests.RequestException as e:
+            status = e.response.status_code if e.response else 'N/A'
+            logger.error(f"Error getting page {page_id} ({status}): {e}")
             return None
     
     def create_page(self, space_key: str, title: str, content: str, parent_id: str = None) -> Dict:
@@ -703,16 +747,18 @@ class ConfluenceAPI:
             if parent_id:
                 data['ancestors'] = [{'id': parent_id}]
             
-            response = requests.post(
+            response = self.session.post(
                 f"{self.base_url}/rest/api/content",
                 auth=self.auth,
                 headers=self.headers,
-                json=data
+                json=data,
+                timeout=10
             )
             response.raise_for_status()
             return response.json()
-        except Exception as e:
-            logger.error(f"Error creating page: {e}")
+        except requests.RequestException as e:
+            status = e.response.status_code if e.response else 'N/A'
+            logger.error(f"Error creating page ({status}): {e}")
             raise
     
     def update_page(self, page_id: str, title: str, content: str, version: int) -> Dict:
@@ -730,30 +776,34 @@ class ConfluenceAPI:
                 }
             }
             
-            response = requests.put(
+            response = self.session.put(
                 f"{self.base_url}/rest/api/content/{page_id}",
                 auth=self.auth,
                 headers=self.headers,
-                json=data
+                json=data,
+                timeout=10
             )
             response.raise_for_status()
             return response.json()
-        except Exception as e:
-            logger.error(f"Error updating page: {e}")
+        except requests.RequestException as e:
+            status = e.response.status_code if e.response else 'N/A'
+            logger.error(f"Error updating page ({status}): {e}")
             raise
     
     def delete_page(self, page_id: str) -> bool:
         """Delete a page from Confluence."""
         try:
-            response = requests.delete(
+            response = self.session.delete(
                 f"{self.base_url}/rest/api/content/{page_id}",
                 auth=self.auth,
-                headers=self.headers
+                headers=self.headers,
+                timeout=10
             )
             response.raise_for_status()
             return True
-        except Exception as e:
-            logger.error(f"Error deleting page: {e}")
+        except requests.RequestException as e:
+            status = e.response.status_code if e.response else 'N/A'
+            logger.error(f"Error deleting page ({status}): {e}")
             return False
 
 # Initialize components
