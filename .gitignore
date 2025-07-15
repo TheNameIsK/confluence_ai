@@ -1,0 +1,5 @@
+.env
+/old
+/.venv
+/__pycache__
+confluence_rag.db
