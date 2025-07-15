@@ -1,0 +1,9 @@
+flask
+flask-cors
+requests
+numpy
+sentence-transformers
+scikit-learn
+openai
+python-dotenv
+schedule
