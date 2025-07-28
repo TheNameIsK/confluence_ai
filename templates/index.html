@@ -123,6 +123,29 @@
             box-shadow: 0 2px 10px rgba(0,0,0,0.1);
         }
         
+        /* New style for pending action messages */
+        .message.bot.pending-action .message-content {
+            background: linear-gradient(135deg, #e3f2fd 0%, #bbdefb 100%);
+            border: 2px solid #2196f3;
+            color: #1565c0;
+            position: relative;
+        }
+        
+        .message.bot.pending-action .message-content::before {
+            content: "⚡ Action Required";
+            position: absolute;
+            top: -12px;
+            left: 15px;
+            background: #2196f3;
+            color: white;
+            padding: 4px 8px;
+            border-radius: 8px;
+            font-size: 10px;
+            font-weight: 600;
+            text-transform: uppercase;
+            letter-spacing: 0.5px;
+        }
+        
         /* Markdown styling for bot messages */
         .message.bot .message-content h1,
         .message.bot .message-content h2,
@@ -134,6 +157,16 @@
             margin-top: 1em;
             margin-bottom: 0.5em;
             font-weight: 600;
+        }
+        
+        /* Special styling for pending action messages headers */
+        .message.bot.pending-action .message-content h1,
+        .message.bot.pending-action .message-content h2,
+        .message.bot.pending-action .message-content h3,
+        .message.bot.pending-action .message-content h4,
+        .message.bot.pending-action .message-content h5,
+        .message.bot.pending-action .message-content h6 {
+            color: #1565c0;
         }
         
         .message.bot .message-content h1 { font-size: 1.5em; }
@@ -160,6 +193,11 @@
         .message.bot .message-content strong {
             font-weight: 600;
             color: #0052cc;
+        }
+        
+        /* Special styling for pending action messages strong text */
+        .message.bot.pending-action .message-content strong {
+            color: #1565c0;
         }
         
         .message.bot .message-content em {
@@ -196,6 +234,12 @@
             padding: 0.5em 1em;
             background: #f8f9fa;
             font-style: italic;
+        }
+        
+        /* Special styling for pending action messages blockquotes */
+        .message.bot.pending-action .message-content blockquote {
+            border-left: 4px solid #1565c0;
+            background: rgba(255,255,255,0.5);
         }
         
         .message.bot .message-content table {
@@ -236,6 +280,20 @@
             background: #28a745;
             color: white;
         }
+        
+        /* Special avatar styling for pending action messages */
+        .message.bot.pending-action .message-avatar {
+            background: #2196f3;
+            color: white;
+            animation: pulse 2s infinite;
+        }
+        
+        @keyframes pulse {
+            0% { transform: scale(1); }
+            50% { transform: scale(1.1); }
+            100% { transform: scale(1); }
+        }
+        
         .search-info {
             font-size: 12px;
             color: #666;
@@ -244,6 +302,13 @@
             background: #e9ecef;
             border-radius: 12px;
         }
+        
+        /* Special styling for pending action messages search info */
+        .message.bot.pending-action .search-info {
+            background: rgba(255,255,255,0.7);
+            color: #1565c0;
+        }
+        
         .results-section {
             margin-top: 15px;
         }
@@ -253,6 +318,12 @@
             margin-bottom: 10px;
             font-size: 14px;
         }
+        
+        /* Special styling for pending action messages results header */
+        .message.bot.pending-action .results-header {
+            color: #1565c0;
+        }
+        
         .result-item {
             background: #f8f9fa;
             border: 1px solid #e9ecef;
@@ -556,7 +627,14 @@
         function addBotResponse(data) {
             const chatMessages = document.getElementById('chatMessages');
             const messageDiv = document.createElement('div');
-            messageDiv.className = 'message bot';
+            
+            // Check if this is a pending action message
+            const hasPendingAction = data.pending_action && 
+                (data.pending_action.type === 'create_page' || 
+                 data.pending_action.type === 'update_page' || 
+                 data.pending_action.type === 'delete_page');
+            
+            messageDiv.className = hasPendingAction ? 'message bot pending-action' : 'message bot';
             
             // Parse the response through markdown
             let responseContent = data.response;
@@ -577,7 +655,6 @@
             }
             
             if (data.results && data.results.length > 0) {
-                
                 content += `
                     <div class="results-section">
                         <div class="results-header">📄 Related Documents (${data.total_results})</div>
@@ -602,8 +679,11 @@
             
             content += `</div>`;
             
+            // Use different avatar for pending actions
+            const avatar = hasPendingAction ? '⚡' : '🤖';
+            
             messageDiv.innerHTML = `
-                <div class="message-avatar">🤖</div>
+                <div class="message-avatar">${avatar}</div>
                 ${content}
             `;
             

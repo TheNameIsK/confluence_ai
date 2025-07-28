@@ -36,8 +36,8 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 # OpenAI Configuration
-base = os.getenv('OPENAI_BASE_URL')
-openai = OpenAI(base_url=base)
+#base = os.getenv('OPENAI_BASE_URL')
+openai = OpenAI()
 
 # Confluence Configuration
 CONFLUENCE_URL = os.getenv('CONFLUENCE_URL')
@@ -975,6 +975,10 @@ STRICT RULES:
 5. If you find relevant information, end with "Check out the relevant documents below!"
 6. Answer thoroughly the user questions
 
+LANGUAGE SUPPORT
+- **Support both English and Indonesian languages**
+- **Respond in the same language the user uses**
+
 User question: {query}
 
 Context from Confluence documents:
@@ -1235,7 +1239,7 @@ def execute_pending_action(pending_action):
                 current_version
             )
             return {
-                "response": f"✅ Page '{args['page_title']}' updated successfully! You can view it at: {page_info['_links']['webui']}",
+                "response": f"✅ Page '{args['page_title']}' updated successfully! You can view it [right here!]({CONFLUENCE_URL}{result['_links']['webui']})",
                 "search_performed": False
             }
         
